@@ -14,7 +14,7 @@ python -m pip install "git+https://github.com/HoangHiepCS/Large-Language-Bayes-M
 python -c "import llb; print(llb)"
 ```
 
-## Quick Start (Hosted OpenAI-Compatible API)
+## Quick Start (OpenAI-Compatible API)
 
 ```python
 import llb

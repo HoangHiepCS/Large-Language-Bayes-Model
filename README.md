@@ -81,23 +81,6 @@ posterior = llb.infer(
 - `llm_timeout`: HTTP timeout seconds for each LLM call (default `None`, which means no timeout).
 - `llm_max_retries`: retries for transient timeout/network failures (default `2`).
 
-## Local Timeout Troubleshooting
-
-If you see:
-
-`ReadTimeoutError: HTTPConnectionPool(host='127.0.0.1', port=1234): Read timed out.`
-
-common causes and fixes are:
-
-1. Local model generation is slower than your timeout.
-Set `llm_timeout=600` and `llm_max_retries=3`.
-
-2. Endpoint mismatch.
-If you use Ollama native API, use `http://localhost:11434/api/generate`.
-If you use OpenAI-compatible local servers, use their `/v1/chat/completions` URL.
-
-3. Model too heavy for current hardware.
-Try a smaller/faster model first.
 
 ## Notes
 

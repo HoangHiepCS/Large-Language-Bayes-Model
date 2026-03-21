@@ -2,37 +2,10 @@
 
 ## 1) Installation Guide
 
-### Option A: Install from GitHub (recommended for reviewers)
-
 ```bash
-python3 -m venv ~/venvs/llb
-source ~/venvs/llb/bin/activate
 python -m pip install --upgrade pip
 python -m pip install "git+https://github.com/HoangHiepCS/Large-Language-Bayes-Model.git"
 python -c "import llb; print(llb)"
-```
-
-### Option B: Install from local clone (editable mode for development)
-
-```bash
-git clone https://github.com/HoangHiepCS/Large-Language-Bayes-Model.git
-cd Large-Language-Bayes-Model
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-python -c "import llb; print(llb)"
-```
-
-### macOS/Homebrew note (PEP 668)
-
-If you see `externally-managed-environment`, install inside a virtual environment as above.
-Avoid installing into the system Python.
-
-Last-resort (not recommended):
-
-```bash
-python3 -m pip install --break-system-packages --user "git+https://github.com/HoangHiepCS/Large-Language-Bayes-Model.git"
 ```
 
 ## 2) Environment Variables
@@ -68,10 +41,8 @@ posterior = llb.infer(
     api_url="https://api.openai.com/v1/chat/completions",
         api_key=os.environ.get("OPENAI_API_KEY"),
         api_model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
-        llm_timeout=300,
 )
 
-print(posterior["true"][:10])
 ```
 
 ## 4) Local model (OpenAI-compatible server)

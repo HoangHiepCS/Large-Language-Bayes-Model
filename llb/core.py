@@ -16,7 +16,7 @@ def infer(
     mcmc_num_warmup=50,
     mcmc_num_samples=100,
     random_seed=None,
-    llm_timeout=300,
+    llm_timeout=None,
     llm_max_retries=2,
     llm_retry_backoff=2.0,
     log_marginal_num_inner=5,

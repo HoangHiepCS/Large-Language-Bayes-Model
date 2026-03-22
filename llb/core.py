@@ -58,6 +58,7 @@ def infer(
         "compile_failures": 0,
         "inference_failures": 0,
         "nonfinite_log_bound_drops": 0,
+        "shape_mismatch_drops": 0,
         "valid_models_final": 0,
     }
 
@@ -149,10 +150,8 @@ def infer(
                     auto_targets = auto_targets & extra_auto_targets
 
     if not valid:
-        raise NoValidModelsError(
-            "LLM produced 0 valid models out of "
-            f"{diagnostics['generated_models']} generated. Cannot perform inference."
-        )
+        diagnostics["valid_models_final"] = 0
+        raise NoValidModelsError(_build_no_valid_models_message(diagnostics))
 
     if failed_models and verbose:
         print(f"Skipped {len(failed_models)} invalid model(s) during inference.")
@@ -160,6 +159,13 @@ def infer(
     final_targets = list(targets) if targets is not None else sorted(auto_targets or [])
     if not final_targets:
         raise RuntimeError("No target variables are available in valid inferred models.")
+
+    valid, shape_drops = _filter_models_by_target_shape(valid, final_targets)
+    diagnostics["shape_mismatch_drops"] = int(shape_drops)
+    if len(valid) == 0:
+        diagnostics["valid_models_final"] = 0
+        raise NoValidModelsError(_build_no_valid_models_message(diagnostics))
+
     log_bounds = np.array([v["log_marginal_bound"] for v in valid], dtype=np.float64)
 
     finite_mask = np.isfinite(log_bounds)
@@ -172,17 +178,36 @@ def infer(
         valid = valid_filtered
         weights = _softmax_from_logs(log_bounds_filtered)
     else:
-        raise NoValidModelsError(
-            "LLM produced 0 valid models out of "
-            f"{diagnostics['generated_models']} generated. Cannot perform inference."
-        )
+        diagnostics["valid_models_final"] = 0
+        raise NoValidModelsError(_build_no_valid_models_message(diagnostics))
 
     diagnostics["valid_models_final"] = int(len(valid))
 
-    per_model_target_samples = [
-        {target: v["target_samples"][target] for target in final_targets}
-        for v in valid
-    ]
+    per_model_target_samples = []
+    valid_after_shape = []
+    kept_weights = []
+    for m_idx, model_info in enumerate(valid):
+        ok, payload = _normalize_target_sample_map(
+            target_samples=model_info["target_samples"],
+            targets=final_targets,
+        )
+        if not ok:
+            diagnostics["shape_mismatch_drops"] += 1
+            continue
+        per_model_target_samples.append(payload)
+        valid_after_shape.append(model_info)
+        kept_weights.append(float(weights[m_idx]))
+
+    if len(per_model_target_samples) == 0:
+        diagnostics["valid_models_final"] = 0
+        raise NoValidModelsError(_build_no_valid_models_message(diagnostics))
+
+    valid = valid_after_shape
+    weights = np.asarray(kept_weights, dtype=np.float64)
+    weights = weights / np.sum(weights)
+    diagnostics["valid_models_final"] = int(len(valid))
+
+    report_targets = _resolve_report_targets(per_model_target_samples, final_targets)
 
     if auto_print_result:
         print(f"Number of requested models: {diagnostics['requested_models']}")
@@ -193,9 +218,10 @@ def infer(
         print(f"Number of models missing required targets: {diagnostics['missing_targets_failures']}")
         print(f"Number of models that failed to compile: {diagnostics['compile_failures']}")
         print(f"Number of models that failed during inference: {diagnostics['inference_failures']}")
+        print(f"Number of models dropped due to target shape mismatch: {diagnostics['shape_mismatch_drops']}")
         print(f"Number of models dropped due to non-finite log bound: {diagnostics['nonfinite_log_bound_drops']}")
         print(f"Number of valid models used in final aggregation: {diagnostics['valid_models_final']}")
-        for target in final_targets:
+        for target in report_targets:
             per_model_samples = [
                 np.asarray(model_samples[target], dtype=np.float64)
                 for model_samples in per_model_target_samples
@@ -205,6 +231,11 @@ def infer(
                 weights=weights,
                 target_name=target,
             )
+        _print_compact_model_averaging_summary(
+            per_model_target_samples=per_model_target_samples,
+            weights=weights,
+            targets=report_targets,
+        )
 
     draws_per_model = len(per_model_target_samples[0][final_targets[0]])
     total_draws = draws_per_model * len(per_model_target_samples)
@@ -226,27 +257,38 @@ def infer(
     )
 
     if auto_print_result:
-        _print_posterior_summary(posterior_weighted, final_targets)
-        _print_weighted_flat_first10(posterior_weighted, posterior_flat, final_targets)
+        returned_targets = _resolve_report_targets([posterior_weighted], report_targets)
+        _print_posterior_summary(posterior_weighted, returned_targets)
+        _print_weighted_flat_first10(posterior_weighted, posterior_flat, returned_targets)
     return posterior_weighted
 
 
 def _print_posterior_summary(posterior, targets):
     for target in targets:
-        values = posterior.get(target, [])
-        arr = np.asarray(values, dtype=np.float64)
-        print(f"weighted first_10 ({target}): {arr[:10].tolist()}")
-        print(f"weighted mean ({target}): {float(arr.mean()):.6f}")
+        arr = np.asarray(posterior.get(target, []), dtype=np.float64)
+        mean_value = _target_mean(arr)
+        print("--- Weighted Posterior Summary ---")
+        print(f"Target: {target}")
+        _print_mean_summary("weighted", mean_value)
+        print()
 
 
 def _print_weighted_flat_first10(posterior_weighted, posterior_flat, targets):
-    print("--- Weighted vs Flat (first 10) ---")
     for target in targets:
         weighted = np.asarray(posterior_weighted.get(target, []), dtype=np.float64)
         flat = np.asarray(posterior_flat.get(target, []), dtype=np.float64)
-        print(f"target: {target}")
-        print(f"weighted first_10: {weighted[:10].tolist()}")
-        print(f"flat first_10: {flat[:10].tolist()}")
+        weighted_mean = _target_mean(weighted)
+        flat_mean = _target_mean(flat)
+        print("--- Weighted vs Flat Target Summary ---")
+        print(f"Target: {target}")
+        _print_mean_summary("flat", flat_mean)
+        _print_mean_summary("weighted", weighted_mean)
+        if np.asarray(weighted_mean).ndim == 0 and np.asarray(flat_mean).ndim == 0:
+            print(f"difference (weighted - flat): {float(weighted_mean) - float(flat_mean):.6f}")
+        else:
+            diff = np.asarray(weighted_mean, dtype=np.float64) - np.asarray(flat_mean, dtype=np.float64)
+            _print_array_preview("difference (weighted - flat)", diff)
+        print()
 
 
 def _print_model_averaging_summary(samples, weights, target_name):
@@ -256,37 +298,124 @@ def _print_model_averaging_summary(samples, weights, target_name):
         print()
         return
 
-    mu_per_model = np.array([float(np.mean(s)) for s in samples], dtype=np.float64)
-    flat_weights = np.ones(len(mu_per_model), dtype=np.float64) / len(mu_per_model)
+    mu_per_model = [np.asarray(_target_mean(np.asarray(s, dtype=np.float64)), dtype=np.float64) for s in samples]
 
-    mu_flat = float(np.mean(mu_per_model))
-    mu_weighted = float(np.sum(np.asarray(weights, dtype=np.float64) * mu_per_model))
-    diff = mu_weighted - mu_flat
+    # Some generated models may emit the same target name with different shapes.
+    # Summarize the dominant compatible shape instead of crashing on np.stack.
+    shape_groups = {}
+    for idx, mu in enumerate(mu_per_model):
+        key = tuple(mu.shape)
+        shape_groups.setdefault(key, []).append(idx)
+
+    dominant_shape = max(shape_groups, key=lambda k: len(shape_groups[k]))
+    keep_idx = shape_groups[dominant_shape]
+    dropped_idx = [i for i in range(len(mu_per_model)) if i not in keep_idx]
+
+    mu_stack = np.stack([mu_per_model[i] for i in keep_idx], axis=0)
+    kept_weights = np.asarray([weights[i] for i in keep_idx], dtype=np.float64)
+    kept_weights = kept_weights / np.sum(kept_weights)
+
+    mu_flat = np.mean(mu_stack, axis=0)
+    mu_weighted = np.tensordot(kept_weights, mu_stack, axes=(0, 0))
+    diff = np.asarray(mu_weighted, dtype=np.float64) - np.asarray(mu_flat, dtype=np.float64)
 
     print("--- Model Averaging Summary ---")
     print(f"Target: {target_name}")
     print(f"Number of models: {len(mu_per_model)}")
+    if dropped_idx:
+        shape_counts = {str(k): len(v) for k, v in shape_groups.items()}
+        print(f"Shape mismatch detected for target '{target_name}'; using dominant shape {dominant_shape}.")
+        print(f"Shape counts: {shape_counts}")
+        print(f"Dropped models for summary due to shape mismatch: {len(dropped_idx)}")
+    _print_mean_summary("flat", mu_flat)
+    _print_mean_summary("weighted", mu_weighted)
+    if np.asarray(diff).ndim == 0:
+        print(f"Difference (weighted - flat): {float(diff):.6f}")
+    else:
+        _print_array_preview("Difference (weighted - flat)", diff)
     print()
-    print(f"Flat mean prediction: {mu_flat:.4f}")
-    print(f"Weighted mean prediction: {mu_weighted:.4f}")
-    print()
-    print(f"Difference (weighted - flat): {diff:.4f}")
-    print()
-    print("Top 5 models by weight:")
+    print(f"Top 5 models by weight for target '{target_name}':")
 
-    ranked = np.argsort(-np.asarray(weights, dtype=np.float64))
-    for rank_idx in ranked[:5]:
+    ranked_local = np.argsort(-kept_weights)
+    for local_idx in ranked_local[:5]:
+        rank_idx = keep_idx[int(local_idx)]
         w = float(weights[rank_idx])
-        mu_i = float(mu_per_model[rank_idx])
-        print(f"model={int(rank_idx)}, weight={w:.6f}, mu_i={mu_i:.6f}")
+        mu_i = np.asarray(mu_per_model[rank_idx], dtype=np.float64)
+        if mu_i.ndim == 0:
+            print(f"model={int(rank_idx)}, weight={w:.6f}, mu_i={float(mu_i):.6f}")
+        else:
+            preview = mu_i.reshape(-1)[:10].tolist()
+            print(
+                f"model={int(rank_idx)}, weight={w:.6f}, "
+                f"mu_i_shape={tuple(mu_i.shape)}, mu_i_first10={preview}"
+            )
 
-    print("2 least-weighted models:")
-    least_ranked = np.argsort(np.asarray(weights, dtype=np.float64))
-    for rank_idx in least_ranked[:2]:
+    print(f"2 least-weighted models for target '{target_name}':")
+    least_ranked_local = np.argsort(kept_weights)
+    for local_idx in least_ranked_local[:2]:
+        rank_idx = keep_idx[int(local_idx)]
         w = float(weights[rank_idx])
-        mu_i = float(mu_per_model[rank_idx])
-        print(f"model={int(rank_idx)}, weight={w:.6f}, mu_i={mu_i:.6f}")
+        mu_i = np.asarray(mu_per_model[rank_idx], dtype=np.float64)
+        if mu_i.ndim == 0:
+            print(f"model={int(rank_idx)}, weight={w:.6f}, mu_i={float(mu_i):.6f}")
+        else:
+            preview = mu_i.reshape(-1)[:10].tolist()
+            print(
+                f"model={int(rank_idx)}, weight={w:.6f}, "
+                f"mu_i_shape={tuple(mu_i.shape)}, mu_i_first10={preview}"
+            )
     print()
+
+
+def _target_mean(arr):
+    if arr.ndim == 0:
+        return arr
+    if arr.shape[0] == 0:
+        return np.nan
+    return np.mean(arr, axis=0)
+
+
+def _print_mean_summary(label, mean_value):
+    mean_arr = np.asarray(mean_value, dtype=np.float64)
+    if mean_arr.ndim == 0:
+        print(f"{label} mean prediction: {float(mean_arr):.6f}")
+        return
+    print(f"{label} mean prediction shape: {tuple(mean_arr.shape)}")
+    _print_array_preview(f"{label} mean prediction", mean_arr)
+
+
+def _print_array_preview(label, arr):
+    flat = np.asarray(arr, dtype=np.float64).reshape(-1)
+    if flat.size <= 10:
+        print(f"{label} full: {flat.tolist()}")
+    else:
+        print(f"{label} first_10: {flat[:10].tolist()}")
+
+
+def _print_compact_model_averaging_summary(per_model_target_samples, weights, targets):
+    for target in targets:
+        per_model_samples = [
+            np.asarray(model_samples[target], dtype=np.float64)
+            for model_samples in per_model_target_samples
+        ]
+        mu_stack = np.stack([
+            np.asarray(_target_mean(s), dtype=np.float64)
+            for s in per_model_samples
+        ], axis=0)
+        mu_flat = np.mean(mu_stack, axis=0)
+        mu_weighted = np.tensordot(np.asarray(weights, dtype=np.float64), mu_stack, axes=(0, 0))
+        diff = np.asarray(mu_weighted, dtype=np.float64) - np.asarray(mu_flat, dtype=np.float64)
+
+        print("--- Model Averaging (Compact) ---")
+        print(f"Target: {target}")
+        print(f"Number of models: {len(per_model_samples)}")
+        _print_mean_summary("flat", mu_flat)
+        _print_mean_summary("weighted", mu_weighted)
+        if np.asarray(diff).ndim == 0:
+            print(f"difference (weighted - flat): {float(diff):.6f}")
+        else:
+            _print_array_preview("difference (weighted - flat)", diff)
+        print()
 
 
 def _softmax_from_logs(log_values):
@@ -301,12 +430,76 @@ def _resample_weighted_samples(per_model_samples, targets, model_weights, total_
 
     for m_idx in model_choices:
         samples_m = per_model_samples[m_idx]
-        max_len = len(samples_m[targets[0]])
-        s_idx = int(rng.integers(low=0, high=max_len))
+        if any(target not in samples_m for target in targets):
+            continue
+        lengths = [len(samples_m[target]) for target in targets]
+        min_len = int(min(lengths)) if lengths else 0
+        if min_len <= 0:
+            continue
+        s_idx = int(rng.integers(low=0, high=min_len))
         for target in targets:
             out[target].append(samples_m[target][s_idx])
 
     return out
+
+
+def _build_no_valid_models_message(diagnostics):
+    return (
+        "LLM produced 0 valid models out of "
+        f"{diagnostics['generated_models']} generated. Cannot perform inference. "
+        f"requested={diagnostics['requested_models']}, "
+        f"deduplicated={diagnostics['deduplicated_models']}, "
+        f"invalid_syntax_or_parsing={diagnostics['invalid_models_syntax_or_parsing']}, "
+        f"generation_request_failures={diagnostics['generation_request_failures']}, "
+        f"missing_targets={diagnostics['missing_targets_failures']}, "
+        f"compile_failures={diagnostics['compile_failures']}, "
+        f"inference_failures={diagnostics['inference_failures']}, "
+        f"shape_mismatch_drops={diagnostics['shape_mismatch_drops']}, "
+        f"nonfinite_log_bound_drops={diagnostics['nonfinite_log_bound_drops']}."
+    )
+
+
+def _filter_models_by_target_shape(valid_models, targets):
+    if len(valid_models) <= 1:
+        return valid_models, 0
+
+    profiles = []
+    for model in valid_models:
+        target_samples = model.get("target_samples", {})
+        try:
+            draw_lengths = []
+            event_shapes = []
+            for target in targets:
+                arr = np.asarray(target_samples[target])
+                if arr.ndim < 1 or arr.shape[0] <= 0:
+                    raise ValueError("empty target samples")
+                draw_lengths.append(int(arr.shape[0]))
+                event_shapes.append(tuple(arr.shape[1:]))
+            if len(set(draw_lengths)) != 1:
+                profiles.append(None)
+            else:
+                profiles.append(tuple(event_shapes))
+        except Exception:
+            profiles.append(None)
+
+    valid_profiles = [p for p in profiles if p is not None]
+    if not valid_profiles:
+        return [], len(valid_models)
+
+    counts = {}
+    for p in valid_profiles:
+        counts[p] = counts.get(p, 0) + 1
+    dominant_profile = max(counts, key=counts.get)
+
+    kept = []
+    dropped = 0
+    for model, profile in zip(valid_models, profiles):
+        if profile == dominant_profile:
+            kept.append(model)
+        else:
+            dropped += 1
+
+    return kept, dropped
 
 
 def _dedupe_model_codes(codes):
@@ -333,3 +526,54 @@ def _normalize_code_for_hash(code):
             continue
         lines.append(line)
     return "\n".join(lines)
+
+
+def _normalize_target_sample_map(target_samples, targets):
+    arrays = {}
+    for target in targets:
+        if target not in target_samples:
+            return False, f"missing target '{target}'"
+        arr = np.asarray(target_samples[target], dtype=np.float64)
+        if arr.ndim == 0:
+            return False, f"target '{target}' has scalar sample container"
+        arrays[target] = arr
+
+    first_dims = [arrays[target].shape[0] for target in targets]
+    n_ref = int(max(first_dims))
+
+    # Try to repair simple transposition errors: (event_dim, n_samples) -> (n_samples, event_dim)
+    for target in targets:
+        arr = arrays[target]
+        if arr.shape[0] == n_ref:
+            continue
+        if arr.ndim >= 2 and arr.shape[1] == n_ref:
+            arrays[target] = np.swapaxes(arr, 0, 1)
+
+    first_dims_after = [arrays[target].shape[0] for target in targets]
+    if len(set(first_dims_after)) != 1:
+        return False, f"inconsistent sample axis lengths across targets: {first_dims_after}"
+
+    normalized = {target: arrays[target] for target in targets}
+    return True, normalized
+
+
+def _resolve_report_targets(sample_maps, fallback_targets):
+    if not sample_maps:
+        return list(fallback_targets)
+
+    returned = []
+    seen = set()
+
+    for target in fallback_targets:
+        if all(target in sm for sm in sample_maps):
+            returned.append(target)
+            seen.add(target)
+
+    for target in sample_maps[0].keys():
+        if target in seen:
+            continue
+        if all(target in sm for sm in sample_maps):
+            returned.append(target)
+            seen.add(target)
+
+    return returned

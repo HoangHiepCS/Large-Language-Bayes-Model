@@ -39,6 +39,9 @@ def build_messages(text, data, targets):
                 "2. Include needed imports in the code block.\n"
                 "3. Use unique site names across numpyro.sample / numpyro.deterministic / plates.\n"
                 "4. Respect provided goal names exactly.\n"
+                "   For every name in GOAL, the model must create that exact variable name\n"
+                "   (via numpyro.sample or numpyro.deterministic) so it appears in posterior samples.\n"
+                "   Do not omit any GOAL variable.\n"
                 "5. Prefer direct translation fidelity to the paper style.\n"
                 "6. For binary predictions, prefer numpyro.deterministic(name, probability) for goal outputs.\n"
                 "   Do NOT define the same goal name both as numpyro.sample(...) and numpyro.deterministic(...).\n"
@@ -171,6 +174,14 @@ def generate_models_with_diagnostics(llm, text, data, targets, n_models):
                 last_reason = f"parsing_error: duplicate site names: {', '.join(duplicate_names)}"
                 continue
 
+            missing_goal_names = _missing_goal_names(candidate, targets)
+            if missing_goal_names:
+                last_reason = (
+                    "parsing_error: missing goal names: "
+                    + ", ".join(missing_goal_names)
+                )
+                continue
+
             code = candidate
             break
 
@@ -205,3 +216,14 @@ def _duplicate_site_names(code):
         else:
             seen.add(name)
     return sorted(dup)
+
+
+def _missing_goal_names(code, targets):
+    if not targets:
+        return []
+    declared = set(re.findall(r'numpyro\.(?:sample|deterministic)\(\s*["\']([^"\']+)["\']', code))
+    missing = []
+    for name in targets:
+        if isinstance(name, str) and name not in declared:
+            missing.append(name)
+    return missing

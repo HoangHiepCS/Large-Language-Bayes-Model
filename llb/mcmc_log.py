@@ -85,14 +85,15 @@ def estimate_log_marginal_iw(
     num_outer=1000,
     rng_seed=0,
     min_std=1e-4,
+    fallback_log_bound=-1e12,
 ):
     means = {}
     stds = {}
     for name, values in posterior_samples.items():
-        arr = np.asarray(values)
-        means[name] = arr.mean(axis=0)
-        std = arr.std(axis=0)
-        stds[name] = np.maximum(std, min_std)
+        arr = np.asarray(values, dtype=np.float64)
+        mean, std = _finite_mean_std_axis0(arr, min_std=min_std)
+        means[name] = mean
+        stds[name] = std
 
     rng = np.random.default_rng(rng_seed)
     outer_vals = []
@@ -116,13 +117,27 @@ def estimate_log_marginal_iw(
                     )
                 )
 
-            log_joint, _ = log_density(model, (), {"data": data}, z)
-            log_w = float(log_joint) - log_q
+            try:
+                log_joint, _ = log_density(model, (), {"data": data}, z)
+                log_w = float(log_joint) - log_q
+            except Exception:
+                continue
+
+            if not np.isfinite(log_w):
+                continue
             log_ws.append(log_w)
 
-        outer_vals.append(_logmeanexp(log_ws))
+        if len(log_ws) > 0:
+            outer_vals.append(_logmeanexp(log_ws))
 
-    return float(np.mean(outer_vals))
+    if len(outer_vals) == 0:
+        return float(fallback_log_bound)
+
+    finite_outer = np.asarray(outer_vals, dtype=np.float64)
+    finite_outer = finite_outer[np.isfinite(finite_outer)]
+    if finite_outer.size == 0:
+        return float(fallback_log_bound)
+    return float(np.mean(finite_outer))
 
 
 def _logmeanexp(values):
@@ -143,3 +158,28 @@ def _find_unobserved_discrete_sites(model, data, rng_seed):
         if bool(getattr(fn, "has_enumerate_support", False)):
             names.append(name)
     return names
+
+
+def _finite_mean_std_axis0(arr, min_std=1e-4):
+    if arr.ndim == 0:
+        if np.isfinite(arr):
+            return arr, np.asarray(min_std, dtype=np.float64)
+        return np.asarray(0.0, dtype=np.float64), np.asarray(min_std, dtype=np.float64)
+
+    finite = np.isfinite(arr)
+    count = np.sum(finite, axis=0)
+
+    safe_den = np.maximum(count, 1)
+    finite_vals = np.where(finite, arr, 0.0)
+    mean = np.sum(finite_vals, axis=0) / safe_den
+
+    centered = np.where(finite, arr - mean, 0.0)
+    var = np.sum(centered * centered, axis=0) / safe_den
+    std = np.sqrt(var)
+
+    no_finite = count <= 0
+    mean = np.where(no_finite, 0.0, mean)
+    std = np.where(no_finite, float(min_std), std)
+    std = np.maximum(std, float(min_std))
+
+    return mean, std

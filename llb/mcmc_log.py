@@ -32,7 +32,7 @@ def run_inference(code, data, targets=None, num_warmup=500, num_samples=1000, rn
         )
     
     kernel = NUTS(model)
-    mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False)
+    mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=True)
     try:
         mcmc.run(jax.random.PRNGKey(rng_seed), data=data)
     except Exception as exc:

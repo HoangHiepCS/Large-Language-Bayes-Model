@@ -121,7 +121,7 @@ def infer(
     valid, failed_models, auto_targets = _evaluate_candidates(model_codes, start_index=0)
 
     if not valid:
-        extra_goal = max(0, 6 - int(n_models))
+        extra_goal = int(n_models)
         if extra_goal > 0:
             extra_codes_raw, extra_gen_diag = generate_models_with_diagnostics(
                 llm,
@@ -231,8 +231,6 @@ def infer(
                 weights=weights,
                 target_name=target,
             )
-        # Removed compact model averaging summary printout as requested
-
     draws_per_model = len(per_model_target_samples[0][final_targets[0]])
     total_draws = draws_per_model * len(per_model_target_samples)
     posterior_weighted = _resample_weighted_samples(
@@ -388,9 +386,6 @@ def _print_array_preview(label, arr):
         print(f"{label} first_10: {flat[:10].tolist()}")
 
 
-    # Removed _print_compact_model_averaging_summary as requested
-
-
 def _softmax_from_logs(log_values):
     shifted = log_values - np.max(log_values)
     unnorm = np.exp(shifted)
@@ -514,6 +509,7 @@ def _normalize_target_sample_map(target_samples, targets):
     first_dims = [arrays[target].shape[0] for target in targets]
     n_ref = int(max(first_dims))
 
+    # Try to repair simple transposition errors: (event_dim, n_samples) -> (n_samples, event_dim)
     for target in targets:
         arr = arrays[target]
         if arr.shape[0] == n_ref:

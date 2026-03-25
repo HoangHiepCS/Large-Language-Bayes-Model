@@ -54,6 +54,7 @@ def infer(
         "deduplicated_models": int(deduplicated_models),
         "invalid_models_syntax_or_parsing": int(gen_diag.get("invalid_syntax_parsing_count", 0)),
         "generation_request_failures": int(gen_diag.get("generation_request_failures", 0)),
+        "first_failure_reason": _first_request_failure_reason(gen_diag),
         "missing_targets_failures": 0,
         "compile_failures": 0,
         "inference_failures": 0,
@@ -137,6 +138,8 @@ def infer(
             diagnostics["deduplicated_models"] += int(extra_deduplicated)
             diagnostics["invalid_models_syntax_or_parsing"] += int(extra_gen_diag.get("invalid_syntax_parsing_count", 0))
             diagnostics["generation_request_failures"] += int(extra_gen_diag.get("generation_request_failures", 0))
+            if diagnostics["first_failure_reason"] is None:
+                diagnostics["first_failure_reason"] = _first_request_failure_reason(extra_gen_diag)
             extra_valid, extra_failed, extra_auto_targets = _evaluate_candidates(
                 extra_codes,
                 start_index=len(model_codes),
@@ -412,7 +415,7 @@ def _resample_weighted_samples(per_model_samples, targets, model_weights, total_
 
 
 def _build_no_valid_models_message(diagnostics):
-    return (
+    msg = (
         "LLM produced 0 valid models out of "
         f"{diagnostics['generated_models']} generated. Cannot perform inference. "
         f"requested={diagnostics['requested_models']}, "
@@ -425,6 +428,17 @@ def _build_no_valid_models_message(diagnostics):
         f"shape_mismatch_drops={diagnostics['shape_mismatch_drops']}, "
         f"nonfinite_log_bound_drops={diagnostics['nonfinite_log_bound_drops']}."
     )
+    reason = diagnostics.get("first_failure_reason")
+    if reason:
+        msg += f" First failure reason: {reason}"
+    return msg
+
+
+def _first_request_failure_reason(gen_diag):
+    for _slot, reason in gen_diag.get("generation_failures", []):
+        if not reason.startswith("parsing_error:"):
+            return reason
+    return None
 
 
 def _filter_models_by_target_shape(valid_models, targets):

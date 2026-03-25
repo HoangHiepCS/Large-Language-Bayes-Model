@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +31,11 @@ def run_inference(code, data, targets=None, num_warmup=500, num_samples=1000, rn
             "inference_error: Model has unobserved discrete latent site(s) not supported by this pipeline: "
             f"{names}{suffix}. Use continuous latent variables or mark discrete structure explicitly."
         )
-    
+
+    # Cheap validation: one forward trace to catch out-of-support parameters before
+    # spending warmup time on a broken model.
+    _validate_model_support(model, data, rng_seed)
+
     kernel = NUTS(model)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False)
     try:
@@ -144,6 +149,27 @@ def _logmeanexp(values):
     vals = np.asarray(values, dtype=np.float64)
     m = vals.max()
     return float(m + math.log(np.mean(np.exp(vals - m))))
+
+
+def _validate_model_support(model, data, rng_seed):
+    """Run one forward trace and raise if any site has out-of-support values."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            model_trace = trace(seed(model, jax.random.PRNGKey(rng_seed))).get_trace(data=data)
+        except Exception as exc:
+            raise ValueError(f"inference_error: model failed during validation trace: {exc}") from exc
+
+    out_of_support = [
+        str(w.message) for w in caught
+        if issubclass(w.category, UserWarning) and "Out-of-support" in str(w.message)
+    ]
+    if out_of_support:
+        raise ValueError(
+            "inference_error: Model has out-of-support sample site(s) — likely a probability "
+            "sampled from an unbounded distribution (e.g. Normal instead of Beta). "
+            f"Details: {'; '.join(out_of_support[:3])}"
+        )
 
 
 def _find_unobserved_discrete_sites(model, data, rng_seed):

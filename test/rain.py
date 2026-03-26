@@ -14,7 +14,7 @@ data = {
 
 targets = ["outcome_for_next_day"]
 
-API_KEY = 'OPENAI_API_KEY_PLACEHOLDER'
+API_KEY = os.environ["OPENAI_API_KEY"]
 API_MODEL = "gpt-4.1-mini"
 
 posterior = llb.infer(
@@ -24,7 +24,7 @@ posterior = llb.infer(
     api_url="https://api.openai.com/v1/responses",
     api_key=API_KEY,
     api_model=API_MODEL,
-    n_models=16,
+    n_models=4,
     mcmc_num_warmup=50,
     mcmc_num_samples=100,
 )

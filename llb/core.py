@@ -30,14 +30,16 @@ def infer(
 ):
     base_seed = int(random_seed) if random_seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
 
-    llm = LLMClient(
-        api_url=api_url,
-        api_key=api_key,
-        model=api_model,
-        timeout=llm_timeout,
-        max_retries=llm_max_retries,
-        retry_backoff=llm_retry_backoff,
-    )
+    llm_kwargs = {
+        "api_url": api_url,
+        "api_key": api_key,
+        "model": api_model,
+        "max_retries": llm_max_retries,
+        "retry_backoff": llm_retry_backoff,
+    }
+    if llm_timeout is not None:
+        llm_kwargs["timeout"] = llm_timeout
+    llm = LLMClient(**llm_kwargs)
     model_codes, gen_diag = generate_models_with_diagnostics(
         llm,
         text=text,
@@ -435,8 +437,9 @@ def _build_no_valid_models_message(diagnostics):
 
 
 def _first_request_failure_reason(gen_diag):
-    for _slot, reason in gen_diag.get("generation_failures", []):
-        if not reason.startswith("parsing_error:"):
+    failures = gen_diag.get("generation_failures", []) if isinstance(gen_diag, dict) else []
+    for _slot_idx, reason in failures:
+        if isinstance(reason, str) and not reason.startswith("parsing_error:"):
             return reason
     return None
 

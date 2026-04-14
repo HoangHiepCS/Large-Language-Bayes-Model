@@ -18,7 +18,7 @@ class NoValidModelsError(RuntimeError):
     """Raised when no valid generated models remain for aggregation."""
 
 
-def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False):
+def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=0.01):
     """
     Solve the stacking optimization problem with detailed debugging.
     """
@@ -32,24 +32,37 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False):
     print(f"n_datapoints: {n_datapoints}, n_models: {n_models}")
     
     def objective(w):
-        """Negative of the stacking objective (for minimization)."""
-        log_sum = np.zeros(n_datapoints)
+        """Negative stacking objective with entropy regularization."""
+        eps = 1e-12
+        w = np.asarray(w, dtype=np.float64)
+
+        log_sum = np.zeros(n_datapoints, dtype=np.float64)
         for i in range(n_datapoints):
             max_val = np.max(loo_log_liks_matrix[i, :])
             log_sum[i] = max_val + np.log(
                 np.sum(w * np.exp(loo_log_liks_matrix[i, :] - max_val))
             )
-        return -np.mean(log_sum)
+
+        # maximize mean(log_sum) - lambda_reg * sum_k w_k log w_k
+        # => minimize negative of that
+        entropy_term = np.sum(np.clip(w, eps, 1.0) * np.log(np.clip(w, eps, 1.0)))
+        return -np.mean(log_sum) + lambda_reg * entropy_term
     
     def gradient(w):
-        """Gradient of the negative objective."""
-        grad = np.zeros(n_models)
+        """Gradient of the negative objective with entropy regularization."""
+        eps = 1e-12
+        w = np.asarray(w, dtype=np.float64)
+        w_safe = np.clip(w, eps, 1.0)
+
+        grad = np.zeros(n_models, dtype=np.float64)
         for i in range(n_datapoints):
             max_val = np.max(loo_log_liks_matrix[i, :])
             exp_vals = np.exp(loo_log_liks_matrix[i, :] - max_val)
             weighted_sum = np.sum(w * exp_vals)
             grad += exp_vals / weighted_sum
-        return -grad / n_datapoints
+
+        # derivative of lambda_reg * sum_k w_k log w_k is lambda_reg * (log w_k + 1)
+        return -grad / n_datapoints + lambda_reg * (np.log(w_safe) + 1.0)
     
     constraints = {
         'type': 'eq',
@@ -418,7 +431,7 @@ def infer(
         console.rule(style="magenta")
         
         # Optimize
-        weights_loo_subset = _solve_stacking_optimization(loo_matrix, verbose=verbose)
+        weights_loo_subset = _solve_stacking_optimization(loo_matrix, verbose=verbose, lambda_reg=0.01)
         
         # Map back to full valid set
         weights_loo_full = np.zeros(len(valid))

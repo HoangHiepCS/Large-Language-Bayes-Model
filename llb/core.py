@@ -260,7 +260,7 @@ def infer(
     loo_num_warmup=50,      # NEW
     loo_num_samples=100,    # NEW
     use_true_loo=True,      # NEW FLAG
-    loo_lambda_reg=0.01,           # NEW: regularization strength
+    loo_lambda_reg=0.1,           # NEW: regularization strength
     loo_kl_reference='uniform',
     verbose=False,
     auto_print_result=True,
@@ -395,7 +395,7 @@ def infer(
                     if verbose:
                         console.print(f"[yellow]Model {idx}: LOO failed ({loo_exc})[/yellow]")
                     n_data = _get_num_datapoints(data)
-                    model_info["loo_log_liks"] = np.full(n_data, -1e12, dtype=np.float64)
+                    model_info["loo_log_liks"] = np.full(n_data, np.nan, dtype=np.float64)
                     model_info["loo_diagnostics"] = {'method': 'failed', 'error': str(loo_exc)}
 
             except Exception as exc:
@@ -494,16 +494,7 @@ def infer(
     loo_matrix_raw = np.column_stack([v["loo_log_liks"] for v in valid])
     
     # Filter out models where LOO completely failed
-    fallback_threshold = 0.5
-    valid_models_mask = []
-    
-    for j in range(loo_matrix_raw.shape[1]):
-        col = loo_matrix_raw[:, j]
-        num_fallback = np.sum(col < -1e10)
-        frac_fallback = num_fallback / len(col)
-        valid_models_mask.append(frac_fallback < fallback_threshold)
-    
-    valid_models_mask = np.array(valid_models_mask)
+    valid_models_mask = np.all(np.isfinite(loo_matrix_raw), axis=0)
     loo_matrix = loo_matrix_raw[:, valid_models_mask]
     
     num_dropped_loo = int(np.sum(~valid_models_mask))

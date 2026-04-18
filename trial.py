@@ -84,6 +84,25 @@ def parse_args():
     p.add_argument("--mcmc-samples", type=int, default=1000)
     p.add_argument("--loo-warmup", type=int, default=50)
     p.add_argument("--loo-samples", type=int, default=100)
+
+    p.add_argument(
+        "--loo-lambda-reg",
+        type=float,
+        default=0.01,
+        help="KL regularization strength (default: 0.01). Set to 0 for no regularization.",
+    )
+    p.add_argument(
+        "--loo-kl-reference",
+        type=str,
+        default="uniform",
+        choices=["uniform", "bma", "none"],
+        help=(
+            "Reference distribution for KL(ref || w_loo) regularization. "
+            "'uniform' encourages diversity, 'bma' stays close to BMA weights, "
+            "'none' disables regularization (default: uniform)."
+        ),
+    )
+
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -177,6 +196,8 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
         if candidate.is_dir() and any(candidate.glob("code_*.code.json")):
             preload_dir = candidate
 
+    kl_ref = None if args.loo_kl_reference == 'none' else args.loo_kl_reference
+
     label = f"{task_name}/{llm_cfg['name']} n={n_models} [{'preload' if preload_dir else 'live-llm'}]"
     if outer_bar is not None:
         outer_bar.set_description(label)
@@ -204,6 +225,8 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
             loo_num_warmup=args.loo_warmup,
             loo_num_samples=args.loo_samples,
             use_true_loo=True,
+            loo_lambda_reg=args.loo_lambda_reg,
+            loo_kl_reference=kl_ref,
             preloaded_codes_dir=str(preload_dir) if preload_dir else None,
         )
         elapsed = time.time() - start

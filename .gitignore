@@ -4,3 +4,13 @@ experiment_results/
 experiment_results_anant/
 model_cache/
 slurm_logs/
+workshop_final/
+test/
+tasks/
+paper_results/
+notebooks/
+lib/
+cached_posteriors/
+analysis/
+experiments.log
+remaining_experiments.log

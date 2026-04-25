@@ -6,6 +6,9 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from rich import box
+import pickle
+from pathlib import Path
+from scipy.stats import gaussian_kde, norm
 
 from .mcmc_log import estimate_log_marginal_iw, run_inference, estimate_loo_log_likelihoods, _get_num_datapoints
 from .llm import LLMClient
@@ -19,20 +22,114 @@ class NoValidModelsError(RuntimeError):
     """Raised when no valid generated models remain for aggregation."""
 
 
-def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=0.01, kl_reference='uniform', reference_weights=None):
+def _filter_pathological_models(valid_models, final_targets, verbose=False):
     """
-    Solve the stacking optimization problem with detailed debugging.
+    Filter out models with pathological predictions or marginal likelihoods.
     
-    Uses log-space parameterization to avoid numerical issues:
-        θ_k = unconstrained parameters
-        w_k = exp(θ_k) / Σ_j exp(θ_j)  (softmax)
+    Returns:
+        filtered_models: List of non-pathological models
+        num_dropped: Number of models dropped
+    """
+    kept = []
+    dropped = 0
     
-    This ensures w_k > 0 and Σw_k = 1 without constraints or clipping.
+    # Collect all predictions to compute statistics
+    all_means = []
+    all_log_marginals = []
+    
+    for model in valid_models:
+        target_samples = model["target_samples"]
+        log_marg = model.get("log_marginal_bound", -np.inf)
+        
+        # Compute mean prediction for first target
+        if final_targets and final_targets[0] in target_samples:
+            samples = np.asarray(target_samples[final_targets[0]], dtype=np.float64)
+            if samples.ndim > 0 and samples.shape[0] > 0:
+                mean_pred = float(np.mean(samples))
+                all_means.append(mean_pred)
+                all_log_marginals.append(log_marg)
+    
+    if not all_means:
+        return valid_models, 0
+    
+    # Compute robust statistics (use median and MAD to handle outliers)
+    median_pred = np.median(all_means)
+    mad_pred = np.median(np.abs(np.array(all_means) - median_pred))
+    
+    median_log_marg = np.median([lm for lm in all_log_marginals if np.isfinite(lm)])
+    
+    # Define thresholds
+    # For predictions: keep within median ± 100 * MAD (very generous)
+    pred_lower = median_pred - 100 * mad_pred
+    pred_upper = median_pred + 100 * mad_pred
+    
+    # For log marginals: drop if < median - 50 (catastrophically bad)
+    log_marg_threshold = median_log_marg - 50
+    
+    console.print(f"\n[bold cyan]Pathological Model Filtering:[/bold cyan]")
+    console.print(f"  Prediction range: [{pred_lower:.2e}, {pred_upper:.2e}]")
+    console.print(f"  Log marginal threshold: {log_marg_threshold:.2f}")
+    
+    for model in valid_models:
+        target_samples = model["target_samples"]
+        log_marg = model.get("log_marginal_bound", -np.inf)
+        
+        # Check prediction
+        if final_targets and final_targets[0] in target_samples:
+            samples = np.asarray(target_samples[final_targets[0]], dtype=np.float64)
+            if samples.ndim > 0 and samples.shape[0] > 0:
+                mean_pred = float(np.mean(samples))
+                
+                # Drop if prediction is pathological
+                if mean_pred < pred_lower or mean_pred > pred_upper:
+                    if verbose:
+                        console.print(f"  [yellow]Dropped model: mean={mean_pred:.2e} (pathological prediction)[/yellow]")
+                    dropped += 1
+                    continue
+        
+        # Drop if log marginal is catastrophically bad
+        if np.isfinite(log_marg) and log_marg < log_marg_threshold:
+            if verbose:
+                console.print(f"  [yellow]Dropped model: log_marginal={log_marg:.2f} (catastrophically bad)[/yellow]")
+            dropped += 1
+            continue
+        
+        kept.append(model)
+    
+    if dropped > 0:
+        console.print(f"  [green]Filtered: kept {len(kept)}/{len(valid_models)} models (dropped {dropped})[/green]")
+    
+    return kept, dropped
+
+
+def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=0.01, kl_reference='uniform', reference_weights=None, temperature=1.0):
+    """
+    Solve the stacking optimization problem with log-space parameterization.
+    
+    Args:
+        loo_log_liks_matrix: (n_datapoints, n_models) matrix of LOO log likelihoods
+        verbose: Print detailed optimization info
+        lambda_reg: Regularization strength
+        kl_reference: Which reference to use for KL regularization
+                      - 'uniform': KL(uniform || w) - mode-seeking
+                      - 'bma': KL(w_bma || w) - mode-seeking (reverse KL)
+                      - 'custom': Use provided reference_weights
+                      - None or 'none': No regularization (pure stacking)
+        reference_weights: Custom reference weights (only used if kl_reference='custom' or 'bma')
+        temperature: Temperature for LOO scores (higher = softer, default=1.0)
+        
+    Note: We use REVERSE KL: KL(ref || w) - mode-seeking behavior
+          We optimize in log-space (softmax parameterization) for numerical stability
+          We use n_models - 1 free parameters (pin last to 0) to avoid flat direction
     """
     n_datapoints, n_models = loo_log_liks_matrix.shape
     
     if n_models == 1:
         return np.array([1.0])
+    
+    # TEMPERING: Scale LOO scores to prevent extreme concentration
+    # Higher temperature = softer weights
+    loo_matrix_tempered = loo_log_liks_matrix / temperature
     
     # Determine reference distribution for regularization
     if kl_reference is None or kl_reference == 'none':
@@ -59,43 +156,34 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=
     console.rule("[bold cyan]Stacking Optimization[/bold cyan]", style="cyan")
     print(f"n_datapoints: {n_datapoints}, n_models: {n_models}")
     print(f"Regularization: λ={lambda_reg}, Reference: {reg_type}")
-    print(f"Parameterization: Log-space (softmax)")
+    print(f"Parameterization: Log-space (softmax), Temperature: {temperature}")
     
-    def theta_to_weights(theta):
-        """Convert unconstrained θ to weights via softmax.
+    def theta_to_weights(theta_free):
+        """Convert n_models-1 free parameters to n_models weights.
         
-        w_k = exp(θ_k) / Σ_j exp(θ_j)
-        
-        Uses log-sum-exp trick for numerical stability.
+        Pin last θ to 0 to remove flat direction in softmax.
+        This makes optimization more stable.
         """
-        theta = np.asarray(theta, dtype=np.float64)
-        # Numerical stability: subtract max before exp
+        theta = np.zeros(n_models, dtype=np.float64)
+        theta[:-1] = theta_free  # First n-1 are free
+        # theta[-1] = 0.0  (already zero)
+        
+        # Softmax with numerical stability
         theta_shifted = theta - np.max(theta)
         exp_theta = np.exp(theta_shifted)
         weights = exp_theta / np.sum(exp_theta)
         return weights
     
-
-    def _reverse_kl(ref, w, eps=1e-10):
-        ref = np.asarray(ref, dtype=np.float64)
-        w = np.asarray(w, dtype=np.float64)
-        mask = ref > 0
-        return np.sum(ref[mask] * (np.log(ref[mask]) - np.log(np.maximum(w[mask], eps))))
-
-    
-    def objective(theta):
-        """Objective in terms of unconstrained parameters θ.
+    def objective(theta_free):
+        """Objective in terms of n_models-1 unconstrained parameters."""
+        w = theta_to_weights(theta_free)
         
-        No clipping needed! Softmax ensures w > 0 and Σw = 1.
-        """
-        w = theta_to_weights(theta)
-        
-        # Stacking term
+        # Stacking term (using TEMPERED LOO scores)
         log_sum = np.zeros(n_datapoints, dtype=np.float64)
         for i in range(n_datapoints):
-            max_val = np.max(loo_log_liks_matrix[i, :])
+            max_val = np.max(loo_matrix_tempered[i, :])
             log_sum[i] = max_val + np.log(
-                np.sum(w * np.exp(loo_log_liks_matrix[i, :] - max_val))
+                np.sum(w * np.exp(loo_matrix_tempered[i, :] - max_val))
             )
         
         stacking_term = np.mean(log_sum)
@@ -104,64 +192,52 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=
         if ref_weights is None:
             reg_term = 0.0
         else:
-            # KL(ref || w) = Σ ref_k log(ref_k / w_k)
-            #              = Σ ref_k log(ref_k) - Σ ref_k log(w_k)
-            reg_term = lambda_reg * _reverse_kl(ref_weights, w)
+            kl_div = np.sum(ref_weights * (np.log(ref_weights) - np.log(w)))
+            reg_term = lambda_reg * kl_div
         
         return -stacking_term + reg_term
     
-    def gradient(theta):
-        """Gradient in terms of θ using chain rule.
-        
-        ∂L/∂θ_k = Σ_j (∂L/∂w_j) * (∂w_j/∂θ_k)
-        
-        Where ∂w_j/∂θ_k = w_j * (δ_jk - w_k)  (softmax Jacobian)
-        """
-        w = theta_to_weights(theta)
+    def gradient(theta_free):
+        """Gradient w.r.t. n_models-1 free parameters."""
+        w = theta_to_weights(theta_free)
         
         # Compute gradient w.r.t. weights first
         grad_w = np.zeros(n_models, dtype=np.float64)
         
-        # Stacking gradient
+        # Stacking gradient (using TEMPERED scores)
         for i in range(n_datapoints):
-            max_val = np.max(loo_log_liks_matrix[i, :])
-            exp_vals = np.exp(loo_log_liks_matrix[i, :] - max_val)
+            max_val = np.max(loo_matrix_tempered[i, :])
+            exp_vals = np.exp(loo_matrix_tempered[i, :] - max_val)
             weighted_sum = np.sum(w * exp_vals)
             grad_w += exp_vals / weighted_sum
         
         grad_w = -grad_w / n_datapoints
         
-        # Reverse KL gradient
+        # Reverse KL gradient: ∂/∂w_k KL(ref || w) = -ref_k / w_k
         if ref_weights is not None:
-            # ∂/∂w_k KL(ref || w) = -ref_k / w_k
-            kl_grad_w = np.zeros_like(w)
-            mask = ref_weights > 0
-            kl_grad_w[mask] = -ref_weights[mask] / np.maximum(w[mask], 1e-10)
+            kl_grad_w = -ref_weights / w
             grad_w += lambda_reg * kl_grad_w
         
-        # Chain rule: convert grad_w to grad_theta
-        # ∂w_j/∂θ_k = w_j * (δ_jk - w_k)
-        # So: ∂L/∂θ_k = Σ_j grad_w[j] * w_j * (δ_jk - w_k)
-        #              = grad_w[k] * w_k - Σ_j grad_w[j] * w_j * w_k
-        #              = w_k * (grad_w[k] - <grad_w, w>)
-        
+        # Chain rule: softmax Jacobian
+        # ∂L/∂θ_k = w_k * (grad_w[k] - <grad_w, w>)
         grad_w_weighted_mean = np.dot(grad_w, w)
-        grad_theta = w * (grad_w - grad_w_weighted_mean)
+        grad_theta_full = w * (grad_w - grad_w_weighted_mean)
         
-        return grad_theta
+        # Return gradient only for free parameters (first n-1)
+        return grad_theta_full[:-1]
     
     # Initialize at uniform weights: θ_k = 0 → w_k = 1/K
-    theta0 = np.zeros(n_models, dtype=np.float64)
-    w0 = theta_to_weights(theta0)
+    theta0_free = np.zeros(n_models - 1, dtype=np.float64)
+    w0 = theta_to_weights(theta0_free)
     
     console.print(f"Initial weights (uniform): [yellow]{w0[:5]}[/yellow]... (showing first 5)")
-    console.print(f"Initial objective value: [cyan]{objective(theta0):.10f}[/cyan]")
-    initial_grad = gradient(theta0)
+    console.print(f"Initial objective value: [cyan]{objective(theta0_free):.10f}[/cyan]")
+    initial_grad = gradient(theta0_free)
     console.print(f"Initial gradient norm: [cyan]{np.linalg.norm(initial_grad):.10f}[/cyan]")
     console.print(f"Initial gradient (first 5): [yellow]{initial_grad[:5]}[/yellow]")
     
     if ref_weights is not None:
-        initial_kl = _reverse_kl(ref_weights, w0)
+        initial_kl = np.sum(ref_weights * (np.log(ref_weights) - np.log(w0)))
         console.print(f"Initial KL(ref||w): [cyan]{initial_kl:.6f}[/cyan]")
     
     if np.allclose(initial_grad, 0, atol=1e-8):
@@ -170,11 +246,11 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=
         console.rule(style="cyan")
         return w0
     
-    # Optimize in θ-space (NO CONSTRAINTS OR BOUNDS!)
+    # Optimize (no constraints or bounds needed!)
     result = minimize(
         objective,
-        theta0,
-        method='BFGS',  # Can use BFGS now since no constraints!
+        theta0_free,
+        method='BFGS',
         jac=gradient,
         options={'gtol': 1e-9, 'maxiter': 1000, 'disp': verbose}
     )
@@ -184,7 +260,7 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=
     console.print(f"  Message: [dim]{result.message}[/dim]")
     print(f"  Iterations: {result.nit}")
     console.print(f"  Final objective: [cyan]{result.fun:.10f}[/cyan]")
-    console.print(f"  Objective improvement: [green]{objective(theta0) - result.fun:.10f}[/green]")
+    console.print(f"  Objective improvement: [green]{objective(theta0_free) - result.fun:.10f}[/green]")
     
     # Convert final θ back to weights
     weights = theta_to_weights(result.x)
@@ -193,15 +269,16 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=
     console.print(f"  Weight range: [[cyan]{weights.min():.6f}[/cyan], [cyan]{weights.max():.6f}[/cyan]]")
     console.print(f"  Weight std: [cyan]{np.std(weights):.6f}[/cyan]")
     console.print(f"  Weight sum (should be 1.0): [cyan]{np.sum(weights):.10f}[/cyan]")
+    console.print(f"  Effective sample size (ESS): [cyan]{1.0/np.sum(weights**2):.2f}[/cyan]")
     
     if ref_weights is not None:
-        final_kl = _reverse_kl(ref_weights, weights)
+        final_kl = np.sum(ref_weights * (np.log(ref_weights) - np.log(weights)))
         console.print(f"  Final KL(ref||w): [cyan]{final_kl:.6f}[/cyan]")
         console.print(f"  KL reduction: [green]{initial_kl - final_kl:+.6f}[/green]")
         
         # Forward KL for comparison
-        #forward_kl = np.sum(weights * (np.log(weights) - np.log(ref_weights)))
-        #console.print(f"  [dim]For comparison, KL(w||ref): {forward_kl:.6f}[/dim]")
+        forward_kl = np.sum(weights * (np.log(weights) - np.log(ref_weights)))
+        console.print(f"  [dim]For comparison, KL(w||ref): {forward_kl:.6f}[/dim]")
     
     if np.allclose(weights, w0, atol=1e-6):
         console.print("\n[yellow]⚠️  WARNING: Weights did not change from initial uniform![/yellow]")
@@ -212,6 +289,7 @@ def _solve_stacking_optimization(loo_log_liks_matrix, verbose=False, lambda_reg=
     console.rule(style="cyan")
     
     return weights
+
 
 def _solve_stacking_optimization_simple(loo_log_liks_matrix):
     """
@@ -248,11 +326,85 @@ def _solve_stacking_optimization_simple(loo_log_liks_matrix):
     weights = np.maximum(result.x, 0.0)
     return weights / np.sum(weights)
 
+def _compute_test_elpd_for_model(model, posterior_samples, data_train, data_test, target_key, verbose=False):
+    """
+    Compute test ELPD for a single model using posterior samples.
+    
+    Args:
+        model: NumPyro model function
+        posterior_samples: Dict of posterior samples {param_name: array}
+        data_train: Training data dict
+        data_test: Test data dict  
+        target_key: Target variable name
+        verbose: Print debug info
+    
+    Returns:
+        float: Mean test ELPD across test points (higher is better)
+    """
+    from numpyro.infer import Predictive
+    import jax
+    
+    # Get test values
+    if target_key not in data_test:
+        # Try to find the matching key
+        for key in data_test.keys():
+            if isinstance(data_test[key], (list, np.ndarray)):
+                target_key = key
+                break
+    
+    x_test = np.asarray(data_test[target_key], dtype=float)
+    n_test = len(x_test)
+    
+    if n_test == 0:
+        return np.nan
+    
+    try:
+        # Generate posterior predictive samples
+        predictive = Predictive(model, posterior_samples)
+        predictions = predictive(jax.random.PRNGKey(0), data=data_train)
+        
+        # Select observation key
+        obs_keys = [k for k in predictions.keys() if 'obs' in k.lower()]
+        if len(obs_keys) == 0:
+            obs_keys = list(predictions.keys())
+        obs_key = obs_keys[0]
+        
+        pred_samples = np.asarray(predictions[obs_key]).ravel()
+        pred_samples = pred_samples[np.isfinite(pred_samples)]
+        
+        if pred_samples.size < 2:
+            return np.nan
+        
+        # Compute log predictive density at each test point using KDE
+        if np.std(pred_samples) < 1e-12:
+            # Use Gaussian fallback for constant predictions
+            mu = float(np.mean(pred_samples))
+            sigma = 1e-6
+            log_densities = [np.log(max(norm.pdf(x_i, loc=mu, scale=sigma), 1e-300)) 
+                            for x_i in x_test]
+        else:
+            kde = gaussian_kde(pred_samples)
+            log_densities = []
+            for x_i in x_test:
+                try:
+                    density = max(float(kde.evaluate([x_i])[0]), 1e-300)
+                    log_densities.append(np.log(density))
+                except:
+                    log_densities.append(np.nan)
+        
+        return float(np.nanmean(log_densities))
+        
+    except Exception as e:
+        if verbose:
+            console.print(f"[yellow]Test ELPD computation failed: {e}[/yellow]")
+        return np.nan
 
 def infer(
     text,
     data,
     targets=None,
+    test_data=None, 
+    cache_dir=None, 
     api_url=None,
     api_key=None,
     api_model=None,
@@ -266,11 +418,12 @@ def infer(
     log_marginal_num_inner=5,
     log_marginal_num_outer=80,
     loo_num_inner=25,
-    loo_num_warmup=50,      # NEW
-    loo_num_samples=100,    # NEW
-    use_true_loo=True,      # NEW FLAG
-    loo_lambda_reg=0.1,           # NEW: regularization strength
+    loo_num_warmup=50,
+    loo_num_samples=100,
+    use_true_loo=True,
+    loo_lambda_reg=0.01,
     loo_kl_reference='uniform',
+    loo_temperature=3.0,
     verbose=False,
     auto_print_result=True,
     preloaded_codes_dir=None,
@@ -308,7 +461,7 @@ def infer(
             targets=targets,
             n_models=n_models,
         )
-    #print(model_codes)
+    
     generated_models = len(model_codes)
     all_generated_codes = model_codes.copy()
     model_codes, deduplicated_models = _dedupe_model_codes(model_codes)
@@ -325,10 +478,12 @@ def infer(
         "inference_failures": 0,
         "nonfinite_log_bound_drops": 0,
         "shape_mismatch_drops": 0,
+        "pathological_drops": 0,
+        "loo_failures": 0,
         "valid_models_final": 0,
     }
 
-    def _evaluate_candidates(codes, start_index):
+    def _evaluate_candidates(codes, start_index, cache_dir=None):
         valid_local = []
         failed_local = []
         auto_targets_local = None
@@ -354,12 +509,26 @@ def infer(
                     rng_seed=base_seed + idx,
                 )
 
-                # Build model_info dict - COMPUTE BOTH
                 model_info = {
                     "code": code,
                     "target_samples": infer_out["target_samples"],
                     "available_sites": infer_out["available_sites"],
+                    "posterior_samples": infer_out["samples"],  
                 }
+
+                if cache_dir is not None:
+                    cache_file = Path(cache_dir) / f"model_{idx:04d}_posterior.pkl"
+                    cache_file.parent.mkdir(exist_ok=True, parents=True)
+                    try:
+                        with open(cache_file, 'wb') as f:
+                            pickle.dump({
+                                "model_index": idx,
+                                "posterior_samples": {k: v.tolist() for k, v in infer_out["samples"].items()},
+                                "code": code,
+                            }, f)
+                    except Exception as cache_exc:
+                        if verbose:
+                            console.print(f"[yellow]Failed to cache model {idx}: {cache_exc}[/yellow]")
 
                 # Always compute marginal likelihood
                 try:
@@ -390,7 +559,7 @@ def infer(
                         num_samples=loo_num_samples,
                         rng_seed=base_seed + 20_000 + idx,
                         use_true_loo=use_true_loo,
-                        return_diagnostics=True,  # Get diagnostics
+                        return_diagnostics=True,
                     )
                     
                     if isinstance(loo_result, dict):
@@ -404,6 +573,7 @@ def infer(
                     if verbose:
                         console.print(f"[yellow]Model {idx}: LOO failed ({loo_exc})[/yellow]")
                     n_data = _get_num_datapoints(data)
+                    # USE NAN INSTEAD OF -1e12 SENTINEL
                     model_info["loo_log_liks"] = np.full(n_data, np.nan, dtype=np.float64)
                     model_info["loo_diagnostics"] = {'method': 'failed', 'error': str(loo_exc)}
 
@@ -432,7 +602,7 @@ def infer(
 
         return valid_local, failed_local, auto_targets_local
 
-    valid, failed_models, auto_targets = _evaluate_candidates(model_codes, start_index=0)
+    valid, failed_models, auto_targets = _evaluate_candidates(model_codes, start_index=0, cache_dir=cache_dir)
 
     if not valid and llm is not None:
         extra_goal = int(n_models)
@@ -456,6 +626,7 @@ def infer(
             extra_valid, extra_failed, extra_auto_targets = _evaluate_candidates(
                 extra_codes,
                 start_index=len(model_codes),
+                cache_dir=cache_dir
             )
             valid.extend(extra_valid)
             failed_models.extend(extra_failed)
@@ -483,6 +654,16 @@ def infer(
         raise NoValidModelsError(_build_no_valid_models_message(diagnostics))
     
     # ========================================
+    # FILTER PATHOLOGICAL MODELS
+    # ========================================
+    valid, pathological_drops = _filter_pathological_models(valid, final_targets, verbose=verbose)
+    diagnostics["pathological_drops"] = int(pathological_drops)
+    
+    if len(valid) == 0:
+        diagnostics["valid_models_final"] = 0
+        raise NoValidModelsError(_build_no_valid_models_message(diagnostics))
+    
+    # ========================================
     # METHOD 1: Marginal Likelihood (BMA-style)
     # ========================================
     log_bounds = np.array([v["log_marginal_bound"] for v in valid], dtype=np.float64)
@@ -493,6 +674,7 @@ def infer(
         weights_bma = _softmax_from_logs(log_bounds_filtered)
         weights_bma_full = np.zeros(len(valid))
         weights_bma_full[finite_mask] = weights_bma
+        weights_bma_full = weights_bma_full / np.sum(weights_bma_full)
     else:
         console.print("[red]All marginal likelihood bounds are non-finite![/red]")
         weights_bma_full = np.ones(len(valid)) / len(valid)
@@ -501,20 +683,28 @@ def infer(
     # METHOD 2: LOO Stacking
     # ========================================
     loo_matrix_raw = np.column_stack([v["loo_log_liks"] for v in valid])
+
+    loo_matrix_raw[np.abs(loo_matrix_raw) > 1e6] = np.nan
     
-    # Filter out models where LOO completely failed
+    # Drop ANY model with ANY failed LOO entry (NaN)
     valid_models_mask = np.all(np.isfinite(loo_matrix_raw), axis=0)
     loo_matrix = loo_matrix_raw[:, valid_models_mask]
     
     num_dropped_loo = int(np.sum(~valid_models_mask))
+    diagnostics["loo_failures"] = num_dropped_loo
+    
     if num_dropped_loo > 0:
-        console.print(f"[yellow]LOO: Dropped {num_dropped_loo} models due to computation failures[/yellow]")
+        console.print(f"[yellow]LOO: Dropped {num_dropped_loo} models with failed LOO computation[/yellow]")
     
     if loo_matrix.shape[1] > 0:
+        # Matrix stabilization: row-wise centering
+        loo_matrix = loo_matrix - np.max(loo_matrix, axis=1, keepdims=True)
+        
         # Diagnostic
         console.rule("[bold magenta]LOO Matrix Diagnostic[/bold magenta]", style="magenta")
-        console.print(f"Shape: [cyan]{loo_matrix.shape}[/cyan]")
-        print(f"\nFirst 3 rows (first 3 datapoints):")
+        console.print(f"Shape: [cyan]{loo_matrix.shape}[/cyan] (after dropping {num_dropped_loo} models)")
+        console.print(f"Temperature: [cyan]{loo_temperature}[/cyan]")
+        print(f"\nFirst 3 rows (first 3 datapoints, after centering):")
         print(loo_matrix[:3, :])
         print(f"\nVariance per datapoint (across models):")
         for i in range(min(6, loo_matrix.shape[0])):
@@ -525,18 +715,19 @@ def infer(
         console.print(f"Overall range: [green]{np.max(loo_matrix) - np.min(loo_matrix):.8f}[/green]")
         
         # Check if all columns are identical
-        first_col = loo_matrix[:, 0]
-        all_same = True
-        for j in range(1, loo_matrix.shape[1]):
-            if not np.allclose(loo_matrix[:, j], first_col, rtol=1e-5):
-                all_same = False
-                break
-        
-        if all_same:
-            console.print("\n[red]⚠️  WARNING: ALL MODELS HAVE IDENTICAL LOO VALUES![/red]")
-            print("This means the LOO computation is broken, not the optimization.")
-        else:
-            console.print(f"\n[green]✓ Models have different LOO values[/green]")
+        if loo_matrix.shape[1] > 1:
+            first_col = loo_matrix[:, 0]
+            all_same = True
+            for j in range(1, loo_matrix.shape[1]):
+                if not np.allclose(loo_matrix[:, j], first_col, rtol=1e-5):
+                    all_same = False
+                    break
+            
+            if all_same:
+                console.print("\n[red]⚠️  WARNING: ALL MODELS HAVE IDENTICAL LOO VALUES![/red]")
+                print("This means the LOO computation is broken, not the optimization.")
+            else:
+                console.print(f"\n[green]✓ Models have different LOO values[/green]")
         
         console.rule(style="magenta")
         
@@ -546,13 +737,14 @@ def infer(
             verbose=verbose, 
             lambda_reg=loo_lambda_reg,
             kl_reference=loo_kl_reference,
-            reference_weights=weights_bma_full[valid_models_mask] if loo_kl_reference == 'bma' else None
-            )
+            reference_weights=weights_bma_full[valid_models_mask] if loo_kl_reference == 'bma' else None,
+            temperature=loo_temperature,
+        )
         
         # Map back to full valid set
         weights_loo_full = np.zeros(len(valid))
         weights_loo_full[valid_models_mask] = weights_loo_subset
-        weights_loo_full = weights_loo_full / np.sum(weights_loo_full)  # Renormalize
+        weights_loo_full = weights_loo_full / np.sum(weights_loo_full)
     else:
         console.print("[red]All models failed LOO computation![/red]")
         weights_loo_full = np.ones(len(valid)) / len(valid)
@@ -569,6 +761,117 @@ def infer(
             )
             final_loo_objective += log_sum_i
         final_loo_objective /= loo_matrix.shape[0]
+
+    # ========================================
+    # COMPUTE TEST ELPD
+    # ========================================
+    test_elpd_per_model = []
+    test_elpd_bma = None
+    test_elpd_loo = None
+    test_elpd_uniform = None
+
+    if test_data is not None and len(valid) > 0:
+        console.rule("[bold cyan]Computing Test ELPD[/bold cyan]", style="cyan")
+        
+        # Determine target key in test data
+        test_target_key = final_targets[0] if final_targets else None
+        if test_target_key and test_target_key not in test_data:
+            # Try to find matching key
+            for key in test_data.keys():
+                if isinstance(test_data[key], (list, np.ndarray)):
+                    test_target_key = key
+                    break
+        
+        if test_target_key:
+            n_test = len(test_data[test_target_key])
+            console.print(f"Test data: {n_test} points, Target: {test_target_key}")
+            
+            # Progress bar for test ELPD
+            test_bar = tqdm(
+                enumerate(valid),
+                total=len(valid),
+                desc="Test ELPD",
+                unit="model",
+                leave=False,
+                dynamic_ncols=True,
+            )
+            
+            for i, model_info in test_bar:
+                try:
+                    # Reconstruct model
+                    exec_globals = {}
+                    exec(model_info["code"], exec_globals)
+                    model_fn = exec_globals.get("model")
+                    
+                    if model_fn is None:
+                        test_elpd_per_model.append(np.nan)
+                        continue
+                    
+                    # Use cached posterior samples (already in memory from inference)
+                    posterior = model_info.get("posterior_samples")
+                    
+                    if posterior is None:
+                        test_elpd_per_model.append(np.nan)
+                        continue
+                    
+                    # Compute test ELPD for this model
+                    test_elpd_i = _compute_test_elpd_for_model(
+                        model_fn, 
+                        posterior, 
+                        data, 
+                        test_data, 
+                        test_target_key,
+                        verbose=verbose
+                    )
+                    test_elpd_per_model.append(test_elpd_i)
+                    
+                    test_bar.set_postfix_str(
+                        f"ELPD={test_elpd_i:.3f}" if np.isfinite(test_elpd_i) else "ELPD=NaN"
+                    )
+                    
+                except Exception as e:
+                    if verbose:
+                        console.print(f"[yellow]Test ELPD failed for model {i}: {e}[/yellow]")
+                    test_elpd_per_model.append(np.nan)
+            
+            test_bar.close()
+            
+            # Compute weighted test ELPDs
+            test_elpd_array = np.array(test_elpd_per_model)
+            valid_mask = np.isfinite(test_elpd_array)
+            
+            if np.sum(valid_mask) > 0:
+                # Normalize weights for valid models only
+                weights_bma_valid = weights_bma_full[valid_mask]
+                weights_bma_valid = weights_bma_valid / np.sum(weights_bma_valid)
+                
+                weights_loo_valid = weights_loo_full[valid_mask]
+                weights_loo_valid = weights_loo_valid / np.sum(weights_loo_valid)
+                
+                test_elpd_bma = float(np.sum(weights_bma_valid * test_elpd_array[valid_mask]))
+                test_elpd_loo = float(np.sum(weights_loo_valid * test_elpd_array[valid_mask]))
+                test_elpd_uniform = float(np.mean(test_elpd_array[valid_mask]))
+                
+                console.print(f"\n[bold]Test ELPD Results:[/bold]")
+                console.print(f"  Models with valid test ELPD: [green]{np.sum(valid_mask)}/{len(valid)}[/green]")
+                console.print(f"  Uniform:  [dim]{test_elpd_uniform:.4f}[/dim]")
+                console.print(f"  BMA:      [yellow]{test_elpd_bma:.4f}[/yellow]")
+                console.print(f"  LOO:      [green]{test_elpd_loo:.4f}[/green]")
+                
+                # Highlight best
+                best_elpd = max(test_elpd_uniform, test_elpd_bma, test_elpd_loo)
+                if test_elpd_loo == best_elpd:
+                    console.print(f"  [bold green]✓ LOO achieves best test ELPD[/bold green]")
+                elif test_elpd_bma == best_elpd:
+                    console.print(f"  [bold yellow]✓ BMA achieves best test ELPD[/bold yellow]")
+                else:
+                    console.print(f"  [bold dim]✓ Uniform achieves best test ELPD[/bold dim]")
+            else:
+                console.print("[red]All test ELPD computations failed[/red]")
+        else:
+            console.print("[yellow]Could not determine test target key[/yellow]")
+        
+        console.rule(style="cyan")
     
     # ========================================
     # COMPARISON TABLE
@@ -586,12 +889,14 @@ def infer(
     comparison_table.add_column("LOO Weight", style="green", justify="right")
     comparison_table.add_column("Difference", style="magenta", justify="right")
     comparison_table.add_column("Log Marginal", style="cyan", justify="right")
+    comparison_table.add_column("LOO Status", style="dim", justify="center")
     
     for i in range(len(valid)):
         w_bma = weights_bma_full[i]
         w_loo = weights_loo_full[i]
         diff = w_loo - w_bma
         log_marg = log_bounds[i]
+        loo_ok = "✓" if valid_models_mask[i] else "✗"
         
         # Color code difference
         if abs(diff) > 0.1:
@@ -606,17 +911,21 @@ def infer(
             f"{w_bma:.6f}",
             f"{w_loo:.6f}",
             diff_str,
-            f"{log_marg:.2f}" if np.isfinite(log_marg) else "—"
+            f"{log_marg:.2f}" if np.isfinite(log_marg) else "—",
+            loo_ok
         )
     
     console.print(comparison_table)
     
     # Summary statistics
     console.print(f"\n[bold]Weight Statistics:[/bold]")
+    console.print(f"  Models with valid LOO: [green]{np.sum(valid_models_mask)}/{len(valid)}[/green]")
     console.print(f"  BMA entropy: [yellow]{-np.sum(weights_bma_full * np.log(weights_bma_full + 1e-10)):.4f}[/yellow]")
     console.print(f"  LOO entropy: [green]{-np.sum(weights_loo_full * np.log(weights_loo_full + 1e-10)):.4f}[/green]")
     console.print(f"  BMA max weight: [yellow]{weights_bma_full.max():.6f}[/yellow]")
     console.print(f"  LOO max weight: [green]{weights_loo_full.max():.6f}[/green]")
+    console.print(f"  BMA ESS: [yellow]{1.0/np.sum(weights_bma_full**2):.2f}[/yellow]")
+    console.print(f"  LOO ESS: [green]{1.0/np.sum(weights_loo_full**2):.2f}[/green]")
     console.print(f"  L1 distance: [magenta]{np.sum(np.abs(weights_loo_full - weights_bma_full)):.6f}[/magenta]")
     console.print(f"  Final LOO objective: [green]{final_loo_objective:.4f}[/green]")
     console.rule(style="cyan")
@@ -705,6 +1014,8 @@ def infer(
         console.print(f"Number of models that failed to compile: [red]{diagnostics['compile_failures']}[/red]" if diagnostics['compile_failures'] > 0 else f"Number of models that failed to compile: [dim]{diagnostics['compile_failures']}[/dim]")
         console.print(f"Number of models that failed during inference: [red]{diagnostics['inference_failures']}[/red]" if diagnostics['inference_failures'] > 0 else f"Number of models that failed during inference: [dim]{diagnostics['inference_failures']}[/dim]")
         console.print(f"Number of models dropped due to target shape mismatch: [yellow]{diagnostics['shape_mismatch_drops']}[/yellow]" if diagnostics['shape_mismatch_drops'] > 0 else f"Number of models dropped due to target shape mismatch: [dim]{diagnostics['shape_mismatch_drops']}[/dim]")
+        console.print(f"Number of pathological models dropped: [yellow]{diagnostics['pathological_drops']}[/yellow]" if diagnostics['pathological_drops'] > 0 else f"Number of pathological models dropped: [dim]{diagnostics['pathological_drops']}[/dim]")
+        console.print(f"Number of models with failed LOO: [yellow]{diagnostics['loo_failures']}[/yellow]" if diagnostics['loo_failures'] > 0 else f"Number of models with failed LOO: [dim]{diagnostics['loo_failures']}[/dim]")
         console.print(f"Number of valid models used in final aggregation: [bold green]{diagnostics['valid_models_final']}[/bold green]")
         
         # Print both weight summaries
@@ -804,6 +1115,11 @@ def infer(
         "final_loo_objective": float(final_loo_objective),
         "log_marginal_per_model": log_bounds.tolist(),
         "loo_diagnostics_per_model": [v.get("loo_diagnostics") for v in valid],
+        "test_elpd_per_model": test_elpd_per_model if test_data else None,  
+        "test_elpd_bma": test_elpd_bma,  
+        "test_elpd_loo": test_elpd_loo,  
+        "test_elpd_uniform": test_elpd_uniform,  
+        "cache_dir": str(cache_dir) if cache_dir else None,  
         "model_codes": all_generated_codes,
     }
 
@@ -985,6 +1301,8 @@ def _build_no_valid_models_message(diagnostics):
         f"compile_failures={diagnostics['compile_failures']}, "
         f"inference_failures={diagnostics['inference_failures']}, "
         f"shape_mismatch_drops={diagnostics['shape_mismatch_drops']}, "
+        f"pathological_drops={diagnostics['pathological_drops']}, "
+        f"loo_failures={diagnostics['loo_failures']}, "
         f"nonfinite_log_bound_drops={diagnostics['nonfinite_log_bound_drops']}."
     )
     reason = diagnostics.get("first_failure_reason")

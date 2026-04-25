@@ -38,12 +38,15 @@ from pathlib import Path
 
 import numpy as np
 from tqdm.auto import tqdm
+from rich.console import Console
 
 import llb
 
 
 DEFAULT_SCRATCH_ROOT = "/scratch3/workspace/edmondcunnin_umass_edu-siple/paper_results"
 RESULTS_DIR = Path("experiment_results_anant")
+
+console = Console()
 
 
 def parse_args():
@@ -102,6 +105,11 @@ def parse_args():
             "'none' disables regularization (default: uniform)."
         ),
     )
+    p.add_argument(
+        "--cache-posteriors",
+        action="store_true",
+        help="Cache posterior samples to disk for future analysis.",
+    )
 
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -113,6 +121,9 @@ def load_task(path: Path) -> dict:
     missing = [k for k in ("text", "data", "targets") if k not in task]
     if missing:
         raise ValueError(f"task {path} missing required keys: {missing}")
+    # test_data is optional - add if not present
+    if "test_data" not in task:
+        task["test_data"] = None
     return task
 
 
@@ -151,7 +162,7 @@ def extract_metrics(result, target, llm_name, n_models_req, elapsed):
     def _ess(w):
         return float(1.0 / np.sum(w ** 2))
 
-    return {
+    metrics = {
         "llm_name": llm_name,
         "n_models_requested": int(n_models_req),
         "elapsed_time_seconds": float(elapsed),
@@ -164,6 +175,8 @@ def extract_metrics(result, target, llm_name, n_models_req, elapsed):
         "n_models_inference_failures": int(diag.get("inference_failures", 0)),
         "n_models_shape_mismatch": int(diag.get("shape_mismatch_drops", 0)),
         "n_models_nonfinite_log_bound": int(diag.get("nonfinite_log_bound_drops", 0)),
+        "n_models_pathological_drops": int(diag.get("pathological_drops", 0)),
+        "n_models_loo_failures": int(diag.get("loo_failures", 0)),
         "n_models_valid_final": int(diag.get("valid_models_final", 0)),
         "valid_model_rate": diag.get("valid_models_final", 0) / max(1, n_models_req),
         "epistemic_var_uniform": float(result["epistemic_uncertainty_uniform"][target]),
@@ -185,6 +198,14 @@ def extract_metrics(result, target, llm_name, n_models_req, elapsed):
         "final_loo_objective": float(result["final_loo_objective"]),
         "log_marginal_per_model": result["log_marginal_per_model"],
     }
+    
+    # Add test ELPD metrics if available
+    if result.get("test_elpd_loo") is not None:
+        metrics["test_elpd_uniform"] = float(result["test_elpd_uniform"])
+        metrics["test_elpd_bma"] = float(result["test_elpd_bma"])
+        metrics["test_elpd_loo"] = float(result["test_elpd_loo"])
+        
+    return metrics
 
 
 def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, outer_bar=None) -> dict:
@@ -197,6 +218,11 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
             preload_dir = candidate
 
     kl_ref = None if args.loo_kl_reference == 'none' else args.loo_kl_reference
+    
+    # Set up cache directory if requested
+    cache_dir = None
+    if args.cache_posteriors:
+        cache_dir = f"cached_posteriors/{task_name}_{llm_cfg['name']}_n{n_models}"
 
     label = f"{task_name}/{llm_cfg['name']} n={n_models} [{'preload' if preload_dir else 'live-llm'}]"
     if outer_bar is not None:
@@ -207,6 +233,8 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
         print(f"Running: {label}")
         if preload_dir:
             print(f"  preload: {preload_dir}")
+        if cache_dir:
+            print(f"  cache: {cache_dir}")
         print("=" * 80)
 
     start = time.time()
@@ -215,6 +243,8 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
             task["text"],
             task["data"],
             task["targets"],
+            test_data=task.get("test_data"),  # ← ADD THIS
+            cache_dir=cache_dir,  # ← ADD THIS
             api_url=llm_cfg.get("api_url"),
             api_key=llm_cfg.get("api_key"),
             api_model=llm_cfg.get("api_model"),
@@ -231,6 +261,31 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
         )
         elapsed = time.time() - start
         metrics = extract_metrics(result, primary_target, llm_cfg["name"], n_models, elapsed)
+        
+        # Print test evaluation results if available
+        if result.get("test_elpd_loo") is not None:
+            console.print(f"\n[bold cyan]═══ Test Evaluation ═══[/bold cyan]")
+            console.print(f"  Test ELPD (Uniform): [dim]{result['test_elpd_uniform']:.4f}[/dim]")
+            console.print(f"  Test ELPD (BMA):     [yellow]{result['test_elpd_bma']:.4f}[/yellow]")
+            console.print(f"  Test ELPD (LOO):     [green]{result['test_elpd_loo']:.4f}[/green]")
+            
+            # Show improvement
+            improvement_vs_bma = result['test_elpd_loo'] - result['test_elpd_bma']
+            improvement_vs_uniform = result['test_elpd_loo'] - result['test_elpd_uniform']
+            
+            if improvement_vs_bma > 0:
+                console.print(f"  [green]✓ LOO beats BMA by {improvement_vs_bma:+.4f}[/green]")
+            elif improvement_vs_bma < 0:
+                console.print(f"  [yellow]✗ BMA beats LOO by {-improvement_vs_bma:+.4f}[/yellow]")
+            else:
+                console.print(f"  [dim]= LOO and BMA tied[/dim]")
+            
+            if improvement_vs_uniform > 0:
+                console.print(f"  [green]✓ LOO beats Uniform by {improvement_vs_uniform:+.4f}[/green]")
+        
+        if result.get("cache_dir") is not None:
+            console.print(f"\n[bold cyan]Cached posteriors:[/bold cyan] {result['cache_dir']}")
+        
         return {
             "success": True,
             "task": task_name,
@@ -245,6 +300,8 @@ def run_one(task: dict, task_name: str, llm_cfg: dict, n_models: int, args, oute
     except Exception as e:
         elapsed = time.time() - start
         print(f"\n[FAIL] {task_name}/{llm_cfg['name']} n={n_models}: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "task": task_name,
@@ -321,20 +378,42 @@ def main():
         json.dump(all_results, f, indent=2)
     print(f"\nAll done. Combined: {summary_path}")
 
-    # Text summary
-    print("\n" + "=" * 120)
-    print(f"{'task':<30} {'llm':<14} {'n':<5} {'valid':<6} {'Epi_Uni':<10} {'Epi_BMA':<10} {'Epi_LOO':<10} {'L1':<7} {'t(s)':<7}")
-    print("-" * 120)
-    for r in all_results:
-        if r["success"]:
-            m = r["metrics"]
-            print(f"{r['task']:<30} {r['llm_name']:<14} {m['n_models_requested']:<5} "
-                  f"{m['n_models_valid_final']:<6} "
-                  f"{m['epistemic_var_uniform']:<10.4g} {m['epistemic_var_bma']:<10.4g} "
-                  f"{m['epistemic_var_loo']:<10.4g} {m['l1_distance_loo_bma']:<7.3f} "
-                  f"{m['elapsed_time_seconds']:<7.1f}")
-        else:
-            print(f"{r['task']:<30} {r['llm_name']:<14} {r['n_models']:<5} FAILED: {r['error']}")
+    # Text summary with test ELPD if available
+    has_test_elpd = any(r.get("success") and r.get("metrics", {}).get("test_elpd_loo") is not None 
+                        for r in all_results)
+    
+    if has_test_elpd:
+        print("\n" + "=" * 140)
+        print(f"{'task':<30} {'llm':<14} {'n':<5} {'valid':<6} {'Epi_BMA':<10} {'Epi_LOO':<10} "
+              f"{'Test_BMA':<10} {'Test_LOO':<10} {'L1':<7} {'t(s)':<7}")
+        print("-" * 140)
+        for r in all_results:
+            if r["success"]:
+                m = r["metrics"]
+                test_bma = f"{m.get('test_elpd_bma', 0):<10.4f}" if 'test_elpd_bma' in m else "—         "
+                test_loo = f"{m.get('test_elpd_loo', 0):<10.4f}" if 'test_elpd_loo' in m else "—         "
+                print(f"{r['task']:<30} {r['llm_name']:<14} {m['n_models_requested']:<5} "
+                      f"{m['n_models_valid_final']:<6} "
+                      f"{m['epistemic_var_bma']:<10.4g} {m['epistemic_var_loo']:<10.4g} "
+                      f"{test_bma} {test_loo} "
+                      f"{m['l1_distance_loo_bma']:<7.3f} {m['elapsed_time_seconds']:<7.1f}")
+            else:
+                print(f"{r['task']:<30} {r['llm_name']:<14} {r['n_models']:<5} FAILED: {r['error']}")
+    else:
+        print("\n" + "=" * 120)
+        print(f"{'task':<30} {'llm':<14} {'n':<5} {'valid':<6} {'Epi_Uni':<10} {'Epi_BMA':<10} "
+              f"{'Epi_LOO':<10} {'L1':<7} {'t(s)':<7}")
+        print("-" * 120)
+        for r in all_results:
+            if r["success"]:
+                m = r["metrics"]
+                print(f"{r['task']:<30} {r['llm_name']:<14} {m['n_models_requested']:<5} "
+                      f"{m['n_models_valid_final']:<6} "
+                      f"{m['epistemic_var_uniform']:<10.4g} {m['epistemic_var_bma']:<10.4g} "
+                      f"{m['epistemic_var_loo']:<10.4g} {m['l1_distance_loo_bma']:<7.3f} "
+                      f"{m['elapsed_time_seconds']:<7.1f}")
+            else:
+                print(f"{r['task']:<30} {r['llm_name']:<14} {r['n_models']:<5} FAILED: {r['error']}")
 
 
 if __name__ == "__main__":
